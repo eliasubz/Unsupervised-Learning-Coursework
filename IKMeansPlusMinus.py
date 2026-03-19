@@ -24,17 +24,6 @@ class IKMeansPlusMinus(BaseEstimator, ClusterMixin):
         self.random_state = random_state
         self.printing = printing
 
-    def _get_assignment(self, X, centers):
-        """
-        Uses scipy's C-optimized VQ to find 1st nearest.
-        To find 2nd nearest efficiently without a full dist matrix,
-        we temporarily mask the 1st and run VQ again.
-        """
-        labels, dists = vq(X, centers)
-
-        # To get 2nd nearest (required for Cost Eq. 1) efficiently:
-        # We only do this for the full set when needed to save time.
-        return labels, dists
 
     def _get_full_metrics(self, X, centers):
         tree = cKDTree(centers)
@@ -43,13 +32,6 @@ class IKMeansPlusMinus(BaseEstimator, ClusterMixin):
         # Return: labels, second_labels, dist1, dist2
         return idx[:, 0], idx[:, 1], dist[:, 0], dist[:, 1]
 
-    def _update_centers(self, X, labels):
-        centers = np.zeros((self.n_clusters, X.shape[1]))
-        for k in range(self.n_clusters):
-            mask = labels == k
-            if np.any(mask):
-                centers[k] = np.mean(X[mask], axis=0)
-        return centers
 
     def t_k_means(self, X, centers, labels, second_labels, si, sj):
         curr_centers = centers.copy()
@@ -60,9 +42,9 @@ class IKMeansPlusMinus(BaseEstimator, ClusterMixin):
 
         ap_initial = np.where((labels == sj) | (second_labels == sj))[0]
         
-        full_tree = cKDTree(centers[list(ac)])
         first_iter = True
-        max_inner_iters = 15
+        max_inner_iters = 10
+
 
         for _ in range(max_inner_iters):
             if not ac:
@@ -90,12 +72,6 @@ class IKMeansPlusMinus(BaseEstimator, ClusterMixin):
                 break
 
             # Step 3: Query ALL centers for affected points, not just AC ∪ AC-Adjacent
-            # This ensures boundary points always find their true nearest center
-            # k_val = min(2, len(curr_centers))
-            # _, all_idx = full_tree.query(X[ap_indices], k=k_val)
-
-            # new_1st = all_idx[:, 0]
-            # new_2nd = all_idx[:, 1] if k_val > 1 else new_1st.copy()
             relevant = ac.union(ac_adjacent)
             relevant_indices = np.array(list(relevant), dtype=int)
             relevant_centers = curr_centers[relevant_indices]
@@ -115,21 +91,13 @@ class IKMeansPlusMinus(BaseEstimator, ClusterMixin):
             # Apply updates
             curr_labels[ap_indices] = new_1st
             curr_second[ap_indices] = new_2nd
+
             # Step 4: actually update centers in AC
             for idx in ac_list:
                 mask = curr_labels == idx
                 if np.any(mask):
                     curr_centers[idx] = np.mean(X[mask], axis=0)
 
-            # # Step 4: Update centers in AC
-            # for idx in ac_list:
-            #     mask = (curr_labels == idx)
-            #     if np.any(mask):
-            #         curr_centers[idx] = np.mean(X[mask], axis=0)
-
-            # Rebuild full tree since AC centers moved
-            if potential_ac:
-                full_tree = cKDTree(curr_centers)
 
             ac = potential_ac
 
@@ -193,8 +161,8 @@ class IKMeansPlusMinus(BaseEstimator, ClusterMixin):
             si = np.argmax(gains)
 
             # Instruction 4: terminate if k/2 clusters have a larger gain than si
-            # if np.sum(gains > gains[si]) >= self.n_clusters / 2:
-            #     break
+            if np.sum(gains > gains[si]) >= self.n_clusters / 2:
+                break
 
             costs = np.bincount(
                 self.labels_, weights=(d2**2 - d1**2), minlength=self.n_clusters
@@ -254,8 +222,6 @@ class IKMeansPlusMinus(BaseEstimator, ClusterMixin):
                     self.second_centers_ = new_second
                     current_sse = new_sse
 
-                    #
-                    # _, _, d1, d2 = self._get_full_metrics(X, self.cluster_centers_)
                     d1, current_sse = nd1, new_sse
 
                     # Markings
