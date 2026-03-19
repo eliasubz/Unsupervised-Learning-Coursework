@@ -6,12 +6,11 @@ from sklearn.utils import check_array, check_random_state
 from sklearn.datasets import make_blobs
 from scipy.cluster.vq import vq
 from scipy.spatial import cKDTree
-from sklearn.cluster import kmeans_plusplus
 from collections import defaultdict
 
 
 class IKMeansPlusMinus(BaseEstimator, ClusterMixin):
-    def __init__(self, n_clusters=8, max_iters=20, local_refine_steps=5, random_state=None):
+    def __init__(self, n_clusters=8, max_iters=50, local_refine_steps=3, random_state=None):
         self.n_clusters = n_clusters
         self.max_iters = max_iters
         self.local_refine_steps = local_refine_steps
@@ -79,78 +78,96 @@ class IKMeansPlusMinus(BaseEstimator, ClusterMixin):
             curr_centers = self._update_centers(X, curr_labels)
             
         return curr_centers, curr_labels
+    
 
-
-    def t_k_means(self, X, centers, labels, second_labels, si, sj, radius_mult=1.5):
-        # Step #1: Setup
-        ac = {si, sj}
+    def t_k_means(self, X, centers, labels, second_labels, si, sj):
         curr_centers = centers.copy()
         curr_labels = labels.copy()
         curr_second = second_labels.copy()
-        
-        # Pre-calculate a fixed radius based on global density to avoid sampling every time
-        # This radius defines the "Topical" zone
-        global_avg_dist = np.mean(np.linalg.norm(curr_centers[0] - curr_centers[1:]))
-        radius = (global_avg_dist / np.sqrt(self.n_clusters)) * radius_mult
 
-        # Build Tree ONCE
+        ac = {si, sj}
+
+        ap_initial = np.where(
+            (labels == sj) | (second_labels == sj)
+        )[0]
+
+        # Build tree ONCE here, rebuild only when centers move
         full_tree = cKDTree(curr_centers)
-        
-        # Step 1.4: Initial affected points (orphans of sj)
-        ap_initial_indices = np.where((labels == sj) | (second_labels == sj))[0]
+        first_iter = True
+        max_inner_iters = 10
 
-        max_inner_iters = 10 # Safety cap
-        it = 0
-        
-        while ac and it < max_inner_iters:
-            it += 1
-            # Step #2: Identify AC-Adjacent and AP
+        for _ in range(max_inner_iters):
+            if not ac:
+                break
+
             ac_list = list(ac)
-            
-            # Use the tree to find neighbors of all AC centers at once
-            ac_adjacent = set()
-            for idx in ac_list:
-                neighbors = full_tree.query_ball_point(curr_centers[idx], r=radius)
-                ac_adjacent.update(neighbors)
-            
-            ap_mask = np.isin(curr_labels, ac_list) | np.isin(curr_second, ac_list)
+            ac_array = np.array(ac_list)
+
+
+            # Step 2: AC-Adjacent via second-nearest relationships (vectorized)
+            first_mask = np.isin(curr_labels, ac_array)
+            second_mask = np.isin(curr_second, ac_array)
+            ac_adjacent = set(curr_second[first_mask].tolist())
+            ac_adjacent.update(curr_labels[second_mask].tolist())
+            ac_adjacent -= ac
+
+            # Step 2.4: Collect affected points
+            ap_mask = first_mask | second_mask
             ap_indices = np.where(ap_mask)[0]
-            
-            if it == 1 and ap_initial_indices.size > 0:
-                ap_indices = np.unique(np.concatenate([ap_indices, ap_initial_indices]))
 
-            if ap_indices.size == 0: break
+            if first_iter and ap_initial.size > 0:
+                ap_indices = np.unique(np.concatenate([ap_indices, ap_initial]))
+                first_iter = False
 
-            # Step #3: Update local neighborhood
-            relevant_indices = np.array(list(ac.union(ac_adjacent)), dtype=int)
+            if ap_indices.size == 0:
+                break
+
+            # Step 3: Query full tree, then filter to AC ∪ AC-Adjacent
+            relevant = ac.union(ac_adjacent)
+            relevant_indices = np.array(list(relevant), dtype=int)
             relevant_centers = curr_centers[relevant_indices]
-            
+
             local_tree = cKDTree(relevant_centers)
             k_val = min(2, len(relevant_indices))
             _, local_idx = local_tree.query(X[ap_indices], k=k_val)
-            
+
             new_1st = relevant_indices[local_idx[:, 0]]
-            new_2nd = relevant_indices[local_idx[:, 1]] if k_val > 1 else new_1st
-            
-            # Determine Potential-AC (Step 3.2)
+            new_2nd = relevant_indices[local_idx[:, 1]] if k_val > 1 else new_1st.copy()
+
+            # Step 3.2: Potential-AC from changed assignments
             changed_mask = (curr_labels[ap_indices] != new_1st)
-            potential_ac = set(np.unique(curr_labels[ap_indices][changed_mask]))
-            potential_ac.update(np.unique(new_1st[changed_mask]))
-            
+            potential_ac = set(curr_labels[ap_indices][changed_mask].tolist())
+            potential_ac.update(new_1st[changed_mask].tolist())
+
+            # Apply updates
             curr_labels[ap_indices] = new_1st
             curr_second[ap_indices] = new_2nd
 
-            # Step #4: Vectorized Center Update (Massively faster than for-loop)
-            # We only need to update centers in 'ac'
-            for idx in ac:
-                m = (curr_labels == idx)
-                if np.any(m):
-                    curr_centers[idx] = np.mean(X[m], axis=0)
-
-            ac = potential_ac
-            # Optional: update full_tree only every few iterations if centers move significantly
-            if ac and it % 2 == 0:
+            # Step 4: Update only centers in AC (vectorized per center)
+            # for idx in ac_list:
+            #     mask = (curr_labels == idx)
+            #     if np.any(mask):
+            #         curr_centers[idx] = np.mean(X[mask], axis=0)
+            # With a single vectorized pass:
+            ac_array = np.array(ac_list)
+            first_mask = np.isin(curr_labels, ac_array)
+            second_mask = np.isin(curr_second, ac_array)
+            ac_adjacent = set(curr_second[first_mask].tolist())
+            ac_adjacent.update(curr_labels[second_mask].tolist())
+            ac_adjacent -= ac
+                    
+        
+            # Rebuild tree only if centers moved (i.e. AC was non-empty)
+            # potential_ac is now guaranteed to be defined before this check
+            if potential_ac:
                 full_tree = cKDTree(curr_centers)
+
+            # Cap propagation to avoid going global
+            # if len(potential_ac) > self.n_clusters // 4:
+            #     break
+
+            # Step 5: AC <- Potential-AC
+            ac = potential_ac
 
         return curr_centers, curr_labels, curr_second
     
@@ -207,13 +224,21 @@ class IKMeansPlusMinus(BaseEstimator, ClusterMixin):
             gains[indivisible] = -1
             si = np.argmax(gains)
 
+            # Instruction 4: terminate if k/2 clusters have a larger gain than si
+            # if np.sum(gains > gains[si]) >= self.n_clusters / 2:
+            #     break
+
             costs = np.bincount(self.labels_, weights=(d2**2 - d1**2), minlength=self.n_clusters)
             costs[irremovable] = np.inf
             costs[si] = np.inf
             sj = np.argmin(costs)
+       
             self.timings['loop_selection'] += time.time() - t_sel
 
             if costs[sj] >= gains[si] or (si, sj) in unmatchable_pairs:
+                if np.sum(costs < costs[sj]) >= self.n_clusters / 2:
+                    indivisible[si] = True
+                    continue
                 indivisible[si] = True
                 continue
 
@@ -227,7 +252,7 @@ class IKMeansPlusMinus(BaseEstimator, ClusterMixin):
                 new_centers[sj] = X[si_mask][rs.randint(np.sum(si_mask))]
                 self.timings['loop_teleport'] += time.time() - t_tp
 
-                # TOPICAL REFINEMENT (The speed engine)
+                # TOPICAL REFINEMENT
                 t_tk = time.time()
                 new_centers, new_labels, new_second = self.t_k_means(
                     X, new_centers, self.labels_, self.second_centers_, si, sj
@@ -236,8 +261,9 @@ class IKMeansPlusMinus(BaseEstimator, ClusterMixin):
                 
                 # Final evaluation of trial move
                 t_eval = time.time()
-                _, _, nd1, _ = self._get_full_metrics(X, new_centers)
-                new_sse = np.sum(nd1**2)
+                new_sse = np.sum((X - new_centers[new_labels]) ** 2)
+
+
                 self.timings['loop_eval_metrics'] += time.time() - t_eval
 
                 # 3. Acceptance Step
@@ -251,10 +277,13 @@ class IKMeansPlusMinus(BaseEstimator, ClusterMixin):
                     self.cluster_centers_ = new_centers
                     self.labels_ = new_labels
                     self.second_centers_ = new_second
-                    d1, current_sse = nd1, new_sse
-                    # Error note: d2 is never updated here in your current logic!
-                    
+                    current_sse = new_sse
+
+                    _, _, d1, d2 = self._get_full_metrics(X, self.cluster_centers_)
+
                     # Markings
+                    indivisible = np.zeros(self.n_clusters, dtype=bool)
+                    irremovable = np.zeros(self.n_clusters, dtype=bool)
                     irremovable[sj] = True
                     indivisible[si] = True
                     for idx in strong_sj: irremovable[idx] = True
@@ -273,6 +302,7 @@ class IKMeansPlusMinus(BaseEstimator, ClusterMixin):
         print(f"{'Total fit time':25}: {self.total_fit_time:.4f}s")
         
         return self
+    
     def predict(self, X):
         X = check_array(X)
         return np.argmin(euclidean_distances(X, self.cluster_centers_), axis=1)
@@ -300,3 +330,5 @@ if __name__ == "__main__":
         sse = np.sum([np.sum(np.square(X[final_labels == i] - centers[i])) for i in range(15)])
         
         print(f"{name:15} | SSE: {sse:12.2f} | Time: {elapsed:.4f}s")
+
+    from main import run_paper_reproduction

@@ -9,6 +9,7 @@ from IKMeansPlusMinus import IKMeansPlusMinus
 
 def run_paper_reproduction():
     n_samples = 50500
+    k_values = [125, 250, 500, 1000]
     k_values = [125, 250, 500, 1000, 2000]
 
     # Generate dataset with high complexity to prevent early convergence
