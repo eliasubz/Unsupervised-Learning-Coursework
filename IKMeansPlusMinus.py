@@ -14,9 +14,9 @@ class IKMeansPlusMinus(BaseEstimator, ClusterMixin):
         self,
         n_clusters=8,
         max_iters=50,
-        local_refine_steps=3,
+        local_refine_steps=250,
         random_state=None,
-        printing=True,
+        printing=False,
     ):
         self.n_clusters = n_clusters
         self.max_iters = max_iters
@@ -33,7 +33,7 @@ class IKMeansPlusMinus(BaseEstimator, ClusterMixin):
         return idx[:, 0], idx[:, 1], dist[:, 0], dist[:, 1]
 
 
-    def t_k_means(self, X, centers, labels, second_labels, si, sj):
+    def t_k_means(self, X, centers, labels, second_labels, si, sj, max_inner_iters=20):
         curr_centers = centers.copy()
         curr_labels = labels.copy()
         curr_second = second_labels.copy()
@@ -43,7 +43,6 @@ class IKMeansPlusMinus(BaseEstimator, ClusterMixin):
         ap_initial = np.where((labels == sj) | (second_labels == sj))[0]
         
         first_iter = True
-        max_inner_iters = 10
 
 
         for _ in range(max_inner_iters):
@@ -193,7 +192,7 @@ class IKMeansPlusMinus(BaseEstimator, ClusterMixin):
                 # TOPICAL REFINEMENT
                 t_tk = time.time()
                 new_centers, new_labels, new_second = self.t_k_means(
-                    X, new_centers, self.labels_, self.second_centers_, si, sj
+                    X, new_centers, self.labels_, self.second_centers_, si, sj, max_inner_iters=self.local_refine_steps
                 )
                 self.timings["loop_t_k_means"] += time.time() - t_tk
 
