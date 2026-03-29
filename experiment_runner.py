@@ -32,6 +32,8 @@ warnings.filterwarnings("ignore")
 from IKMeansPlusMinus import IKMeansPlusMinus
 HAS_IKM = True
 
+from unc_init import unc_init
+
 # ===========================================================================
 # CONFIG
 # ===========================================================================
@@ -40,8 +42,8 @@ DEFAULT_CONFIG = {
     "output_dir": "results_w_init",
     "checkpoint_file": "results/checkpoint.json",
     "data_dir": "data",
-    "n_runs_synthetic": 15,
-    "n_runs_realworld": 5,
+    "n_runs_synthetic": 1,
+    "n_runs_realworld": 1,
     "ikm_max_iters": 10,
     "synthetic_datasets": ["A1", "A2", "A3", "S1", "S2", "S3", "S4", "Birch1"],
     "realworld_datasets": ["Iris", "LR", "Musk", "Statlog", "HAR", "ISOLET"],
@@ -209,11 +211,59 @@ def run_ikm(X, k, seed, max_iters):
     return labels, m.cluster_centers_, t
 
 
-RUNNERS = {
-    "KM":    run_km,
-    "KM++":  run_kmpp,
-    "MBK":   run_mbkm,
-}
+class _UNCRandomState(np.random.RandomState):
+    """RandomState subclass that returns fixed indices on the first choice() call."""
+
+    def __init__(self, seed, unc_indices):
+        super().__init__(seed)
+        self._unc_indices = unc_indices
+        self._intercepted = False
+
+    def choice(self, a, size=None, replace=True, p=None):
+        if not self._intercepted:
+            self._intercepted = True
+            return self._unc_indices
+        return super().choice(a, size=size, replace=replace, p=p)
+
+
+class _IKMeansPlusMinusUNC(IKMeansPlusMinus):
+    """IKMeansPlusMinus with UNC (Useful Nearest Centers) initialization."""
+
+    def fit(self, X, y=None):
+        from sklearn.utils import check_array
+        from scipy.spatial import cKDTree
+
+        X = check_array(X)
+
+        # Compute UNC centers (deterministic).
+        unc_centers = unc_init(X, self.n_clusters, verbose=False)
+
+        # Map each UNC center to its nearest data-point index so that the
+        # parent's `X[indices]` assignment reproduces the same centers.
+        tree = cKDTree(X)
+        _, unc_indices = tree.query(unc_centers, k=1)
+
+        # Swap in our custom RandomState; check_random_state passes RandomState
+        # instances through unchanged, so the parent will use it as-is.
+        seed = self.random_state if isinstance(self.random_state, int) else 0
+        saved_rs = self.random_state
+        self.random_state = _UNCRandomState(seed, unc_indices)
+        try:
+            result = super().fit(X, y)
+        finally:
+            self.random_state = saved_rs
+        return result
+
+
+def run_ikm_unc(X, k, seed, max_iters):
+    if not HAS_IKM:
+        return None, None, None
+    start = time.time()
+    m = _IKMeansPlusMinusUNC(n_clusters=k, max_iters=max_iters, random_state=seed).fit(X)
+    t = time.time() - start
+    labels = m.predict(X)
+    return labels, m.cluster_centers_, t
+
 
 
 def get_metrics(X, labels, centers, k):
@@ -273,7 +323,7 @@ def run_experiment(config):
         X = X_raw
         n_runs = config["n_runs_synthetic"]
         accum = {alg: {"ssedm": [], "max_partial": [], "time": []}
-                 for alg in ["KM", "KM++", "MBK", "IKM-+"]}
+                 for alg in ["KM", "KM++", "MBK", "IKM-+", "IKM-+UNC"]}
 
         # Load any already-completed runs from checkpoint
         for alg in list(accum.keys()):
@@ -307,6 +357,10 @@ def run_experiment(config):
                         labels, centers, t = run_ikm(X, k, run, config["ikm_max_iters"])
                         if labels is None:
                             continue
+                    elif alg == "IKM-+UNC":
+                        labels, centers, t = run_ikm_unc(X, k, run, config["ikm_max_iters"])
+                        if labels is None:
+                            continue
 
                     m = get_metrics(X, labels, centers, k)
                     accum[alg]["ssedm"].append(m["ssedm"])
@@ -324,7 +378,7 @@ def run_experiment(config):
         # Aggregate
         row = {"dataset": ds_name, "k": k}
         km_time = np.mean(accum["KM"]["time"]) if accum["KM"]["time"] else np.nan
-        for alg in ["KM", "KM++", "MBK", "IKM-+"]:
+        for alg in ["KM", "KM++", "MBK", "IKM-+", "IKM-+UNC"]:
             if accum[alg]["ssedm"]:
                 row[f"MaxPartial_{alg}"] = np.mean(accum[alg]["max_partial"])
                 row[f"SSEDM_{alg}"]      = np.mean(accum[alg]["ssedm"])
@@ -345,7 +399,7 @@ def run_experiment(config):
     print("REAL-WORLD DATASETS")
     print("="*60)
 
-    for ds_name in config["realworld_datasets"]:
+    # for ds_name in config["realworld_datasets"]:
         print(f"\n--- {ds_name} ---")
         try:
             X_raw, k = load_dataset(ds_name, config.get("data_dir", "data"))
@@ -356,7 +410,7 @@ def run_experiment(config):
         X = X_raw
         n_runs = config["n_runs_realworld"]
         accum = {alg: {"ssedm": [], "max_partial": [], "time": []}
-                 for alg in ["KM", "KM++", "MBK", "IKM-+"]}
+                 for alg in ["KM", "KM++", "MBK", "IKM-+", "IKM-+UNC"]}
 
         for alg in list(accum.keys()):
             for run in range(n_runs):
@@ -388,6 +442,10 @@ def run_experiment(config):
                         labels, centers, t = run_ikm(X, k, run, config["ikm_max_iters"])
                         if labels is None:
                             continue
+                    elif alg == "IKM-+UNC":
+                        labels, centers, t = run_ikm_unc(X, k, run, config["ikm_max_iters"])
+                        if labels is None:
+                            continue
 
                     m = get_metrics(X, labels, centers, k)
                     accum[alg]["ssedm"].append(m["ssedm"])
@@ -399,23 +457,23 @@ def run_experiment(config):
                                        "time": t}
                 except Exception as e:
                     print(f"    [ERROR] {alg} run {run}: {e}")
-            
+
 
             save_checkpoint(config["checkpoint_file"], checkpoint)
         # After the runs loop, print live averages before aggregating
         print(f"\n  Results for {ds_name} so far:")
-        for alg in ["KM", "KM++", "MBK", "IKM-+"]:
+        for alg in ["KM", "KM++", "MBK", "IKM-+", "IKM-+UNC"]:
             if accum[alg]["ssedm"]:
                 avg_ssedm = np.mean(accum[alg]["ssedm"])
                 avg_time  = np.mean(accum[alg]["time"])
                 n         = len(accum[alg]["ssedm"])
-                print(f"    {alg:<8} n={n:>3}  avg SSEDM={avg_ssedm:.2E}  avg time={avg_time:.4f}s")
+                print(f"    {alg:<10} n={n:>3}  avg SSEDM={avg_ssedm:.2E}  avg time={avg_time:.4f}s")
             else:
-                print(f"    {alg:<8} no results yet")
+                print(f"    {alg:<10} no results yet")
 
         row = {"dataset": ds_name, "k": k}
         km_time = np.mean(accum["KM"]["time"]) if accum["KM"]["time"] else np.nan
-        for alg in ["KM", "KM++", "MBK", "IKM-+"]:
+        for alg in ["KM", "KM++", "MBK", "IKM-+", "IKM-+UNC"]:
             if accum[alg]["ssedm"]:
                 row[f"MaxPartial_{alg}"] = np.mean(accum[alg]["max_partial"])
                 row[f"SSEDM_{alg}"]      = np.mean(accum[alg]["ssedm"])
@@ -429,8 +487,9 @@ def run_experiment(config):
         row["tIKM/tKM"] = ikm_time / km_time if km_time and km_time > 0 else np.nan
         realworld_results[ds_name] = row
 
-    return (pd.DataFrame(list(synthetic_results.values())),
-            pd.DataFrame(list(realworld_results.values())))
+    # return (pd.DataFrame(list(synthetic_results.values())),
+    #         pd.DataFrame(list(realworld_results.values())))
+    return (pd.DataFrame(list(synthetic_results.values())),)
 
 
 # ===========================================================================
@@ -449,7 +508,7 @@ import numpy as np
 
 def print_table(df, title):
     # Updated algorithms list to match your data
-    algs = ["KM", "KM++", "MBK", "IKM-+"]
+    algs = ["KM", "KM++", "MBK", "IKM-+", "IKM-+UNC"]
     
     # Helper for consistent Scientific Notation formatting
     def fmt_sci(val):
@@ -537,15 +596,15 @@ def main():
     if args.config:
         with open(args.config) as f:
             config.update(json.load(f))
-
     if args.reset and os.path.exists(config["checkpoint_file"]):
         os.remove(config["checkpoint_file"])
         print("[Reset] Checkpoint cleared.")
 
-    syn_df, rw_df = run_experiment(config)
+    # syn_df, rw_df = run_experiment(config)
+    syn_df, _ = run_experiment(config)
 
     print_table(syn_df, "Table 2 — Synthetic Datasets (averaged over runs)")
-    print_table(rw_df,  "Table 3 — Real-World Datasets")
+    # print_table(rw_df,  "Table 3 — Real-World Datasets")
 
     save_tables(syn_df, rw_df, config["output_dir"])
 
